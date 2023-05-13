@@ -1,26 +1,31 @@
-import { CreateCompletionResponseUsage } from 'openai';
 import { attachDebugger, detachDebugger } from '../helpers/chromeDebugger';
 import {
   disableIncompatibleExtensions,
   reenableExtensions,
 } from '../helpers/disableExtensions';
-import { callDOMAction } from '../helpers/domActions';
-import {
-  ParsedResponse,
-  ParsedResponseSuccess,
-  parseResponse,
-} from '../helpers/parseResponse';
-import { determineNextAction } from '../helpers/determineNextAction';
-import templatize from '../helpers/shrinkHTML/templatize';
 import { getSimplifiedDom } from '../helpers/simplifyDom';
-import { sleep, truthyFilter } from '../helpers/utils';
 import { MyStateCreator } from './store';
+import { ChatOpenAI } from 'langchain/chat_models/openai';
+import { CallbackManager } from 'langchain/callbacks';
+import { LLMResult } from 'langchain/schema';
+import { useAppState } from '../state/store';
+import { DomAgent } from '../helpers/domAgent';
+import templatize from '../helpers/shrinkHTML/templatize';
+import { Tool } from 'langchain/tools';
+import { domTools } from '../helpers/domTools';
+
+type ParsedResponse =
+  | {
+      thought: string;
+      tool: string;
+      input: string;
+    }
+  | {
+      error: string;
+    };
 
 export type TaskHistoryEntry = {
-  prompt: string;
-  response: string;
   action: ParsedResponse;
-  usage: CreateCompletionResponseUsage;
 };
 
 export type CurrentTaskSlice = {
@@ -70,6 +75,63 @@ export const createCurrentTaskSlice: MyStateCreator<CurrentTaskSlice> = (
         state.currentTask.actionStatus = 'attaching-debugger';
       });
 
+      const callbackManager = CallbackManager.fromHandlers({
+        async handleLLMStart(_llm: { name: string }, prompts: string[]) {
+          console.log(JSON.stringify(prompts, null, 2));
+        },
+        async handleLLMEnd(output: LLMResult) {
+          for (const generation of output.generations) {
+            for (const gen of generation) {
+              console.log(gen.text);
+            }
+          }
+
+          try {
+            const action = executor.parse(output.generations[0][0].text.trim());
+
+            set((state) => {
+              state.currentTask.history.push({
+                action: {
+                  thought: action.thought,
+                  tool: action.tool,
+                  input: action.toolInput,
+                },
+              });
+            });
+          } catch {
+            //
+          }
+        },
+      });
+
+      const controller = new AbortController();
+
+      const openAIApiKey = useAppState.getState().settings.openAIKey || '';
+      const modelName = useAppState.getState().settings.selectedModel;
+      const model = new ChatOpenAI(
+        {
+          temperature: 0,
+          modelName,
+          openAIApiKey,
+          callbackManager,
+        },
+        { baseOptions: { signal: controller.signal } }
+      );
+      const tools: Tool[] = [...domTools];
+
+      const executor = new DomAgent({
+        tools,
+        llm: model,
+        returnIntermediateSteps: true,
+        verbose: true,
+        getSimplifiedDom: async () => {
+          const pageDOM = await getSimplifiedDom();
+          const html = pageDOM ? pageDOM.outerHTML : '';
+          return templatize(html);
+        },
+        openAIApiKey,
+      });
+
       try {
         const activeTab = (
           await chrome.tabs.query({ active: true, currentWindow: true })
@@ -84,93 +146,25 @@ export const createCurrentTaskSlice: MyStateCreator<CurrentTaskSlice> = (
         await attachDebugger(tabId);
         await disableIncompatibleExtensions();
 
-        // eslint-disable-next-line no-constant-condition
-        while (true) {
-          if (wasStopped()) break;
+        // set((state) => {
+        //   state.currentTask.status = 'error';
+        // });
 
-          setActionStatus('pulling-dom');
-          const pageDOM = await getSimplifiedDom();
-          if (!pageDOM) {
-            set((state) => {
-              state.currentTask.status = 'error';
-            });
-            break;
+        const interval = setInterval(() => {
+          if (wasStopped()) {
+            // hack to stop agent, just give it no more iterations
+            executor.maxIterations = 0;
+            // stop the existing call
+            controller.abort();
           }
-          const html = pageDOM.outerHTML;
+        }, 500);
+        setActionStatus('performing-action');
+        const result = await executor.call({
+          input: instructions,
+        });
+        clearInterval(interval);
+        result.output;
 
-          if (wasStopped()) break;
-          setActionStatus('transforming-dom');
-          const currentDom = templatize(html);
-
-          const previousActions = get()
-            .currentTask.history.map((entry) => entry.action)
-            .filter(truthyFilter);
-
-          setActionStatus('performing-query');
-
-          const query = await determineNextAction(
-            instructions,
-            previousActions.filter(
-              (pa) => !('error' in pa)
-            ) as ParsedResponseSuccess[],
-            currentDom,
-            3,
-            onError
-          );
-
-          if (!query) {
-            set((state) => {
-              state.currentTask.status = 'error';
-            });
-            break;
-          }
-
-          if (wasStopped()) break;
-
-          setActionStatus('performing-action');
-          const action = parseResponse(query.response);
-
-          set((state) => {
-            state.currentTask.history.push({
-              prompt: query.prompt,
-              response: query.response,
-              action,
-              usage: query.usage,
-            });
-          });
-          if ('error' in action) {
-            onError(action.error);
-            break;
-          }
-          if (
-            action === null ||
-            action.parsedAction.name === 'finish' ||
-            action.parsedAction.name === 'fail'
-          ) {
-            break;
-          }
-
-          if (action.parsedAction.name === 'click') {
-            await callDOMAction('click', action.parsedAction.args);
-          } else if (action.parsedAction.name === 'setValue') {
-            await callDOMAction(
-              action?.parsedAction.name,
-              action?.parsedAction.args
-            );
-          }
-
-          if (wasStopped()) break;
-
-          // While testing let's automatically stop after 50 actions to avoid
-          // infinite loops
-          if (get().currentTask.history.length >= 50) {
-            break;
-          }
-
-          setActionStatus('waiting');
-          // sleep 2 seconds. This is pretty arbitrary; we should figure out a better way to determine when the page has settled.
-          await sleep(2000);
-        }
         set((state) => {
           state.currentTask.status = 'success';
         });

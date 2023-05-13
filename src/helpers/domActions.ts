@@ -71,7 +71,7 @@ async function clickAtPosition(
   await sleep(delayBetweenClicks);
 }
 
-async function click(payload: { elementId: number }) {
+export async function click(payload: { elementId: number }) {
   const objectId = await getObjectId(payload.elementId);
   await scrollIntoView(objectId);
   const { x, y } = await getCenterCoordinates(objectId);
@@ -108,7 +108,7 @@ async function blurFocusedElement() {
   });
 }
 
-async function setValue(payload: {
+export async function setValue(payload: {
   elementId: number;
   value: string;
 }): Promise<void> {
@@ -125,6 +125,8 @@ async function setValue(payload: {
 export const domActions = {
   click,
   setValue,
+  pageUp,
+  pageDown,
 } as const;
 
 export type DOMActions = typeof domActions;
@@ -139,3 +141,83 @@ export const callDOMAction = async <T extends ActionName>(
   // @ts-expect-error - we know that the type is valid
   await domActions[type](payload);
 };
+
+export function getLayoutMetrics(): Promise<GetLayoutMetricsResponse> {
+  return sendCommand(
+    'Page.getLayoutMetrics'
+  ) as Promise<GetLayoutMetricsResponse>;
+}
+
+interface GetLayoutMetricsResponse {
+  layoutViewport: {
+    pageX: number;
+    pageY: number;
+    clientWidth: number;
+    clientHeight: number;
+  };
+  visualViewport: {
+    offsetX: number;
+    offsetY: number;
+    width: number;
+    height: number;
+    scale: number;
+  };
+  contentSize: {
+    width: number;
+    height: number;
+  };
+}
+
+export async function canPageUp(
+  layoutMetrics?: GetLayoutMetricsResponse
+): Promise<boolean> {
+  const lm =
+    layoutMetrics ||
+    ((await sendCommand('Page.getLayoutMetrics')) as GetLayoutMetricsResponse);
+
+  return lm.layoutViewport.pageY > 0;
+}
+
+export async function canPageDown(
+  layoutMetrics?: GetLayoutMetricsResponse
+): Promise<boolean> {
+  const lm =
+    layoutMetrics ||
+    ((await sendCommand('Page.getLayoutMetrics')) as GetLayoutMetricsResponse);
+
+  return (
+    lm.layoutViewport.pageY + lm.layoutViewport.clientHeight <
+    lm.contentSize.height
+  );
+}
+
+export async function pageUp() {
+  const lm = (await sendCommand(
+    'Page.getLayoutMetrics'
+  )) as GetLayoutMetricsResponse;
+
+  if (!(await canPageUp(lm))) {
+    throw new Error('Cannot scroll up any further');
+  }
+
+  const expression = `window.scrollTo(0, 0)`;
+
+  await sendCommand('Runtime.evaluate', {
+    expression,
+  });
+}
+
+export async function pageDown() {
+  const lm = (await sendCommand(
+    'Page.getLayoutMetrics'
+  )) as GetLayoutMetricsResponse;
+
+  if (!(await canPageDown(lm))) {
+    throw new Error('Cannot scroll down any further');
+  }
+
+  const expression = `window.scrollTo(0, document.body.scrollHeight)`;
+  await sendCommand('Runtime.evaluate', {
+    expression,
+  });
+}
